@@ -1,0 +1,1001 @@
+local UEHelpers = require("UEHelpers")
+local GetPlayerController = UEHelpers.GetPlayerController
+local GetWorld = UEHelpers.GetWorld
+
+local MOD_PREFIX = "[SurvivalThirdRing] "
+local MIN_RINGS_FOR_THIRD_SLOT = 1
+local ENABLE_STAT_APPLY = true
+local ENABLE_EQUIP_TRACE = true
+local LOG_VERBOSE = true
+local LOG_STAT_DIAG = true
+local LOG_TICKER = true
+
+local function log(msg)
+    pcall(function() print(MOD_PREFIX .. tostring(msg) .. "\n") end)
+end
+
+local function logStep(tag, msg)
+    if LOG_VERBOSE then pcall(function() log("[" .. tostring(tag) .. "] " .. tostring(msg)) end) end
+end
+
+local function safe(fn)
+    local ok, err = pcall(fn)
+    if not ok then pcall(function() log("Error: " .. tostring(err)) end); return nil end
+    return true
+end
+
+local function safeInWorld(fn)
+    pcall(function()
+        if not GetPlayerController() or not GetWorld() then return end
+        safe(fn)
+    end)
+end
+
+local ThirdRing = {
+    ItemID = 0,
+    ItemBP = nil,
+    DisplayName = nil
+}
+local pendingReapplyThirdRing = false
+
+local function getThirdRingDisplayName()
+    return ThirdRing.DisplayName
+end
+
+local function getThirdRingBP()
+    return ThirdRing.ItemBP
+end
+
+local function setThirdRing(id, bp, displayName)
+    ThirdRing.ItemID = id or 0
+    ThirdRing.ItemBP = bp
+    ThirdRing.DisplayName = displayName
+end
+
+local function clearThirdRingState()
+    setThirdRing(0, nil, nil)
+end
+
+local function getCharacter()
+    local out = nil
+    pcall(function()
+        logStep("CHAR", "getCharacter() start")
+        local pc = GetPlayerController()
+        if not pc or not pc:IsValid() then logStep("CHAR", "fail: no/invalid PlayerController"); return end
+        local pawn = pc.Pawn
+        if not pawn or not pawn:IsValid() then logStep("CHAR", "fail: no/invalid Pawn"); return end
+        logStep("CHAR", "getCharacter() => ok")
+        out = pawn
+    end)
+    return out
+end
+
+local function getInventory(char)
+    local result = nil
+    pcall(function()
+        logStep("INV", "getInventory() start")
+        local pc = GetPlayerController()
+        if pc and pc:IsValid() then
+            local getPlayerInv = pc.GetPlayerInventory
+            if getPlayerInv then
+                local inv = getPlayerInv(pc)
+                if inv and inv:IsValid() then logStep("INV", "getInventory() => GetPlayerInventory(pc)"); result = inv return end
+            end
+        end
+        if not char or not char:IsValid() then logStep("INV", "fail: no char for fallbacks"); return end
+        local inv = char.Inventory
+        if inv and inv:IsValid() then logStep("INV", "getInventory() => char.Inventory"); result = inv return end
+        inv = char.InventoryComponent
+        if inv and inv:IsValid() then logStep("INV", "getInventory() => char.InventoryComponent"); result = inv return end
+        inv = char.PlayerInventory
+        if inv and inv:IsValid() then logStep("INV", "getInventory() => char.PlayerInventory"); result = inv return end
+        inv = char.RemnantPlayerInventory
+        if inv and inv:IsValid() then logStep("INV", "getInventory() => char.RemnantPlayerInventory"); result = inv return end
+        inv = char.MyInventory
+        if inv and inv:IsValid() then logStep("INV", "getInventory() => char.MyInventory"); result = inv return end
+        if pc and pc:IsValid() then
+            inv = pc.InventoryComponent
+            if inv and inv:IsValid() then logStep("INV", "getInventory() => pc.InventoryComponent"); result = inv return end
+            inv = pc.PlayerInventory
+            if inv and inv:IsValid() then logStep("INV", "getInventory() => pc.PlayerInventory"); result = inv return end
+            inv = pc.RemnantPlayerInventory
+            if inv and inv:IsValid() then logStep("INV", "getInventory() => pc.RemnantPlayerInventory"); result = inv return end
+            inv = pc.Inventory
+            if inv and inv:IsValid() then logStep("INV", "getInventory() => pc.Inventory"); result = inv return end
+        end
+        local comps = char.Components
+        if comps and comps.Num then
+            local ok, n = pcall(function() return comps:Num() end)
+            if ok and n and n > 0 then
+                for i = 0, n - 1 do
+                    local c = comps[i]
+                    if c and c:IsValid() and c.GetItems then
+                        logStep("INV", "getInventory() => Components[" .. tostring(i) .. "] (GetItems)")
+                        result = c return
+                    end
+                end
+            end
+        end
+        logStep("INV", "getInventory() => nil")
+    end)
+    return result
+end
+
+local function isRingItem(item)
+    if not item then return false end
+    local bp = item.ItemBP
+    if not bp or not bp:IsValid() then return false end
+    local name = nil
+    if bp.GetFullName then name = bp:GetFullName() end
+    if not name and bp.GetName then name = bp:GetName() end
+    if not name then return true end
+    if string.find(name, "Amulet") or string.find(name, "Neck") then return false end
+    return true
+end
+
+local function getRingDisplayNameFromBP(bp)
+    if not bp or not bp:IsValid() then return "?" end
+    local raw = nil
+    if bp.GetFullName then raw = bp:GetFullName() end
+    if not raw or raw == "" then if bp.GetName then raw = bp:GetName() end end
+    if not raw or raw == "" then return "?" end
+    local short = raw:match("(Trinket_[%w_]+_C)") or raw:match("([^/]+)_C") or raw:match("^([^%s/]+)") or raw
+    short = short:gsub("_C$", ""):gsub("^Trinket_", ""):gsub("_", " ")
+    return #short > 0 and short or "?"
+end
+
+local function getEquippedInSlot(inv, slotName)
+    if not inv or not inv:IsValid() then return nil end
+    local findFn = inv.FindItemByEquipSlotNameID
+    if not findFn then
+        logStep("SLOT", "getEquippedInSlot(" .. tostring(slotName) .. ") no FindItemByEquipSlotNameID")
+        return nil
+    end
+    for _, name in ipairs({ slotName, slotName .. "Slot" }) do
+        local fname = FName(name, EFindName.FNAME_Find)
+        if fname == NAME_None then fname = FName(name, EFindName.FNAME_Add) end
+        local item = findFn(inv, fname)
+        if item then
+            logStep("SLOT", "getEquippedInSlot(" .. tostring(slotName) .. ") => " .. tostring(name))
+            return item
+        end
+    end
+    logStep("SLOT", "getEquippedInSlot(" .. tostring(slotName) .. ") => nil")
+    return nil
+end
+
+local function getUniqueRingCount(inv)
+    if not inv or not inv:IsValid() then logStep("RINGS", "getUniqueRingCount: no inv => 0"); return 0 end
+    local seen = {}
+    local count = 0
+    local t1 = getEquippedInSlot(inv, "Trinket1")
+    local t2 = getEquippedInSlot(inv, "Trinket2")
+    if t1 and t1.ItemBP and t1.ItemBP:IsValid() and isRingItem(t1) then
+        local key = t1.ItemBP.GetFullName and t1.ItemBP:GetFullName() or nil
+        if key and not seen[key] then seen[key] = true count = count + 1 end
+    end
+    if t2 and t2.ItemBP and t2.ItemBP:IsValid() and isRingItem(t2) then
+        local key = t2.ItemBP.GetFullName and t2.ItemBP:GetFullName() or nil
+        if key and not seen[key] then seen[key] = true count = count + 1 end
+    end
+    local getItems = inv.GetItems
+    if not getItems then logStep("RINGS", "getUniqueRingCount: no GetItems => " .. tostring(count)); return count end
+    local items = getItems(inv)
+    if not items then logStep("RINGS", "getUniqueRingCount: GetItems() nil => " .. tostring(count)); return count end
+    local len = 0
+    if items.Num then len = items:Num() end
+    logStep("RINGS", "getUniqueRingCount: inv items count=" .. tostring(len))
+    for i = 0, len - 1 do
+        local entry = items[i]
+        if entry and entry.ItemBP and entry.ItemBP:IsValid() then
+            local key = entry.ItemBP.GetFullName and entry.ItemBP:GetFullName() or nil
+            if key and not seen[key] and isRingItem(entry) then seen[key] = true count = count + 1 end
+        end
+    end
+    if count == 0 and len == 0 then
+        logStep("RINGS", "getUniqueRingCount: len was 0, trying 1..500")
+        for j = 1, 500 do
+            local entry = items[j]
+            if not entry then break end
+            if entry.ItemBP and entry.ItemBP:IsValid() then
+                local key = entry.ItemBP.GetFullName and entry.ItemBP:GetFullName() or nil
+                if key and not seen[key] and isRingItem(entry) then seen[key] = true count = count + 1 end
+            end
+        end
+    end
+    logStep("RINGS", "getUniqueRingCount => " .. tostring(count))
+    return count
+end
+
+local function isEquippedInSlot1Or2(inv, itemID)
+    if not itemID or itemID == 0 then return false end
+    local t1 = getEquippedInSlot(inv, "Trinket1")
+    local t2 = getEquippedInSlot(inv, "Trinket2")
+    if t1 and t1.ItemID == itemID then return true end
+    if t2 and t2.ItemID == itemID then return true end
+    return false
+end
+
+local function sameBP(a, b)
+    if not a or not a:IsValid() or not b or not b:IsValid() then return false end
+    local na, nb = nil, nil
+    if a.GetFullName then na = a:GetFullName() end
+    if b.GetFullName then nb = b:GetFullName() end
+    if not na or not nb then return a == b end
+    return na == nb
+end
+
+local function isEquippedInSlot1Or2ByItem(inv, item)
+    if not inv or not inv:IsValid() or not item or not item.ItemBP then return false end
+    local t1 = getEquippedInSlot(inv, "Trinket1")
+    local t2 = getEquippedInSlot(inv, "Trinket2")
+    if t1 and t1.ItemBP and sameBP(item.ItemBP, t1.ItemBP) then return true end
+    if t2 and t2.ItemBP and sameBP(item.ItemBP, t2.ItemBP) then return true end
+    return false
+end
+
+local function isThirdRingNowInSlot1Or2(inv)
+    local bp = getThirdRingBP()
+    if not bp or not bp:IsValid() or not inv or not inv:IsValid() then return false end
+    local t1 = getEquippedInSlot(inv, "Trinket1")
+    local t2 = getEquippedInSlot(inv, "Trinket2")
+    if t1 and t1.ItemBP and sameBP(bp, t1.ItemBP) then return true end
+    if t2 and t2.ItemBP and sameBP(bp, t2.ItemBP) then return true end
+    return false
+end
+
+local function getSelectedInventoryItem()
+    logStep("SEL", "getSelectedInventoryItem() start")
+    local widget = FindFirstOf("Widget_Inventory_C")
+    if not widget or not widget:IsValid() then logStep("SEL", "no Widget_Inventory_C"); return nil end
+    local sel = widget.SelectedItemID
+    if not sel then sel = widget.SelectedItem end
+    logStep("SEL", "SelectedItemID/SelectedItem => " .. tostring(sel))
+    return sel
+end
+
+local function refreshLabelOnly()
+    local displayName = getThirdRingDisplayName()
+    if not displayName then return end
+    pcall(function()
+        local widget = FindFirstOf("Widget_Inventory_C")
+        if not widget or not widget:IsValid() then return end
+        local label = widget.ItemTypeLabel
+        if not label or not label:IsValid() then return end
+        label:SetText(FText("3rd: " .. displayName))
+    end)
+end
+
+local function updateInventoryLabel()
+    logStep("UI", "updateInventoryLabel() start, DisplayName=" .. tostring(getThirdRingDisplayName()))
+    local displayName = getThirdRingDisplayName()
+    if not displayName then return end
+    pcall(function()
+        local char = getCharacter()
+        local inv = char and getInventory(char)
+        if inv and inv:IsValid() and isThirdRingNowInSlot1Or2(inv) then
+            clearThirdRingState()
+            logStep("UI", "updateInventoryLabel: 3rd ring moved to slot 1/2, cleared")
+        end
+        displayName = getThirdRingDisplayName()
+        if not displayName then
+            local widget = FindFirstOf("Widget_Inventory_C")
+            if widget and widget:IsValid() then
+                local label = widget.ItemTypeLabel
+                if label and label:IsValid() then label:SetText(FText("Trinket")) end
+            end
+            return
+        end
+        local widget = FindFirstOf("Widget_Inventory_C")
+        if not widget or not widget:IsValid() then logStep("UI", "updateInventoryLabel: no widget"); return end
+        local label = widget.ItemTypeLabel
+        if not label or not label:IsValid() then logStep("UI", "updateInventoryLabel: no ItemTypeLabel"); return end
+        label:SetText(FText("3rd: " .. displayName))
+        logStep("UI", "updateInventoryLabel: SetText ok")
+    end)
+end
+
+local tickerStableTicks = 0
+local tickerTotalTicks = 0
+local tickerStarted = false
+local STABLE_TICKS_BEFORE_REFRESH = 5
+
+local function scheduleLabelRefresh()
+    pcall(function()
+        if pendingReapplyThirdRing and getThirdRingDisplayName() then
+            pendingReapplyThirdRing = false
+            pcall(tryApplyThirdRingStats)
+        end
+        tickerTotalTicks = tickerTotalTicks + 1
+        local world = GetWorld()
+        local pc = GetPlayerController()
+        local pawn = pc and pc:IsValid() and pc.Pawn and pc.Pawn
+        if world and world:IsValid() and pc and pc:IsValid() and pawn and pawn:IsValid() then
+            tickerStableTicks = tickerStableTicks + 1
+            if tickerStableTicks >= STABLE_TICKS_BEFORE_REFRESH then
+                if LOG_TICKER then log("[TICKER] refresh stable=" .. tostring(tickerStableTicks)) end
+                refreshLabelOnly()
+            end
+        else
+            tickerStableTicks = 0
+        end
+        if LOG_TICKER and tickerTotalTicks % 10 == 0 then log("[TICKER] total=" .. tostring(tickerTotalTicks) .. " stable=" .. tostring(tickerStableTicks)) end
+    end)
+    pcall(function() ExecuteWithDelay(3000, scheduleLabelRefresh) end)
+end
+
+local SYNC_INTERVAL_MS = 2500
+
+local function syncThirdRingIfMoved()
+    pcall(function()
+        if not getThirdRingDisplayName() then return end
+        local char = getCharacter()
+        local inv = char and getInventory(char)
+        if not inv or not inv:IsValid() then return end
+        if not isThirdRingNowInSlot1Or2(inv) then return end
+        clearThirdRingState()
+        logStep("SYNC", "3rd ring moved to slot 1/2, auto-cleared")
+        local widget = FindFirstOf("Widget_Inventory_C")
+        if widget and widget:IsValid() then
+            local label = widget.ItemTypeLabel
+            if label and label:IsValid() then label:SetText(FText("Trinket")) end
+        end
+    end)
+end
+
+local function tryApplyThirdRingStats()
+    if not ENABLE_STAT_APPLY then return end
+    local bp = getThirdRingBP()
+    if not bp or not bp:IsValid() then log("[STAT] skip: no 3rd ring"); return end
+    local char = getCharacter()
+    if not char or not char:IsValid() then log("[STAT] skip: no character"); return end
+    local statsComp = char.StatsComp or char.StatsComponent or char["StatsComp"] or char.StatComponent
+    if not statsComp or not statsComp:IsValid() then
+        local comps = char.Components
+        if comps and comps.Num then
+            local n = comps:Num()
+            for i = 0, n - 1 do
+                local c = comps[i]
+                if c and c:IsValid() and c.ApplyStats then statsComp = c break end
+            end
+        end
+    end
+    if not statsComp or not statsComp:IsValid() then log("[STAT] skip: no StatsComp"); return end
+    if not statsComp.ApplyStats then log("[STAT] skip: no ApplyStats on StatsComp"); return end
+    local cdo = nil
+    if bp.GetCDO then cdo = bp:GetCDO() end
+    if not cdo or not cdo:IsValid() then log("[STAT] skip: no CDO"); return end
+    local statRow = cdo.Stats or cdo.StatHandle or cdo.StatModifiers or cdo.InspectInfo
+    if not statRow then
+        if cdo.InspectInfo and cdo.InspectInfo.Stats then statRow = cdo.InspectInfo.Stats end
+        if not statRow and cdo.DataTableRowHandle then statRow = cdo.DataTableRowHandle end
+    end
+    if not statRow then log("[STAT] skip: no stat row on CDO"); return end
+
+    if LOG_STAT_DIAG then
+        log("[STAT] --- DIAG START ---")
+        pcall(function() if statsComp.GetFullName then log("[STAT] StatsComp=" .. statsComp:GetFullName()) end end)
+        pcall(function()
+            local cls = statsComp.GetClass and statsComp:GetClass()
+            if cls and cls:IsValid() and cls.GetFullName then
+                local clsName = cls:GetFullName()
+                log("[STAT] StatsComp class=" .. tostring(clsName))
+                if cls.ForEachFunction then
+                    cls:ForEachFunction(function(ufn)
+                        if ufn and ufn:IsValid() and ufn.GetFName then
+                            local n = ufn:GetFName()
+                            log("[STAT]   fn " .. (n and n.ToString and n:ToString() or tostring(n)))
+                        end
+                        return false
+                    end)
+                end
+            end
+        end)
+        pcall(function() if cdo.GetFullName then log("[STAT] CDO=" .. cdo:GetFullName()) end end)
+        log("[STAT] statRow type=" .. type(statRow))
+        pcall(function()
+            for k, v in pairs(statRow) do log("[STAT] statRow." .. tostring(k) .. "=" .. type(v)) end
+        end)
+        local rn, dt = nil, nil
+        pcall(function() rn = statRow.RowName end)
+        pcall(function() dt = statRow.DataTable end)
+        log("[STAT] statRow.RowName=" .. tostring(rn) .. " DataTable=" .. tostring(dt and (dt.IsValid and dt:IsValid())))
+        local rnStr = nil
+        pcall(function() if rn and rn.ToString then rnStr = rn:ToString() end end)
+        if rnStr then log("[STAT] statRow.RowName as string=" .. tostring(rnStr)) end
+        pcall(function()
+            local diagInv = getInventory(char)
+            if diagInv and diagInv:IsValid() then
+                local icls = diagInv.GetClass and diagInv:GetClass()
+                if icls and icls:IsValid() and icls.GetFullName and icls.ForEachFunction then
+                    log("[STAT] Inv class=" .. icls:GetFullName())
+                    icls:ForEachFunction(function(ufn)
+                        if ufn and ufn:IsValid() and ufn.GetFName then
+                            local n = ufn:GetFName()
+                            log("[STAT]   inv_fn " .. (n and n.ToString and n:ToString() or tostring(n)))
+                        end
+                        return false
+                    end)
+                end
+            end
+        end)
+        log("[STAT] --- DIAG END ---")
+    end
+
+    local function try(name, fn)
+        local ok, err = pcall(fn)
+        if LOG_STAT_DIAG then log("[STAT] try " .. name .. " => " .. (ok and "OK" or ("FAIL " .. tostring(err)))) end
+        return ok
+    end
+
+    if statsComp.SetComputedStats then
+    end
+    local invItem = nil
+    pcall(function()
+        local inv2 = getInventory(char)
+        if inv2 and inv2:IsValid() and inv2.FindItemByID and ThirdRing.ItemID then
+            invItem = inv2:FindItemByID(ThirdRing.ItemID)
+        end
+    end)
+    if statsComp.ModifyStat then
+        if try("ModifyStat(ItemBP)", function() statsComp:ModifyStat(bp) end) then return end
+        if try("ModifyStat(ItemBP,0)", function() statsComp:ModifyStat(bp, 0) end) then return end
+        if try("ModifyStat(ItemBP,1)", function() statsComp:ModifyStat(bp, 1) end) then return end
+        if statRow and try("ModifyStat(statRow)", function() statsComp:ModifyStat(statRow) end) then return end
+        if invItem and try("ModifyStat(invItem)", function() statsComp:ModifyStat(invItem) end) then return end
+    end
+    if try("ApplyStats(ItemBP,0)", function() statsComp:ApplyStats(bp, 0) end) then return end
+    if try("ApplyStats(ItemBP,1)", function() statsComp:ApplyStats(bp, 1) end) then return end
+    if try("ApplyStats(ItemBP)", function() statsComp:ApplyStats(bp) end) then return end
+    local rn, dt = nil, nil
+    pcall(function() rn = statRow.RowName dt = statRow.DataTable end)
+    if try("ApplyStats(statRow,0)", function() statsComp:ApplyStats(statRow, 0) end) then return end
+    if rn and dt and dt.IsValid and dt:IsValid() then
+        if try("ApplyStats(DataTable,RowName,0)", function() statsComp:ApplyStats(dt, rn, 0) end) then return end
+        local rnStr = nil
+        pcall(function() if rn.ToString then rnStr = rn:ToString() end end)
+        if rnStr then
+            if try("ApplyStats(DataTable,RowNameStr,0)", function() statsComp:ApplyStats(dt, rnStr, 0) end) then return end
+            if FName and try("ApplyStats(DataTable,FName(RowNameStr),0)", function() statsComp:ApplyStats(dt, FName(rnStr), 0) end) then return end
+            if dt.FindRow then
+                local rowData = nil
+                pcall(function() rowData = dt:FindRow(rnStr) end)
+                if not rowData and FName then pcall(function() rowData = dt:FindRow(FName(rnStr)) end) end
+                if rowData then
+                    if try("ApplyStats(FindRow(data),0)", function() statsComp:ApplyStats(rowData, 0) end) then return end
+                    if try("ApplyStats(FindRow(data),1)", function() statsComp:ApplyStats(rowData, 1) end) then return end
+                elseif LOG_STAT_DIAG then log("[STAT] FindRow(" .. tostring(rnStr) .. ") => nil") end
+            end
+        end
+    end
+    if invItem and try("ApplyStats(invItem,0)", function() statsComp:ApplyStats(invItem, 0) end) then return end
+    if invItem and try("ApplyStats(invItem,1)", function() statsComp:ApplyStats(invItem, 1) end) then return end
+    if try("ApplyStats(statRow)", function() statsComp:ApplyStats(statRow) end) then return end
+    if try("ApplyStats(statRow,1)", function() statsComp:ApplyStats(statRow, 1) end) then return end
+    if try("ApplyStats(statRow,10)", function() statsComp:ApplyStats(statRow, 10) end) then return end
+
+    if ExecuteInGameThread then
+        ExecuteInGameThread(function()
+            if statsComp and statsComp:IsValid() then
+                local ok = pcall(function() statsComp:ApplyStats(statRow, 0) end)
+                if LOG_STAT_DIAG then log("[STAT] try ApplyStats(statRow,0) game thread => " .. (ok and "OK" or "FAIL")) end
+            end
+        end)
+    end
+
+    local altNames = { "ApplyStatsFromItem", "AddStatModifier", "ApplyItemStats", "AddStatsFromItem", "ApplyStatModifiers", "AddStats", "ApplyTrinketStats", "RefreshStats", "RecalculateStats", "UpdateStats" }
+    for _, name in ipairs(altNames) do
+        local fn = statsComp[name]
+        if fn and type(fn) == "function" then
+            if try("StatsComp." .. name .. "(statRow,0)", function() fn(statsComp, statRow, 0) end) then return end
+            if try("StatsComp." .. name .. "(ItemBP,0)", function() fn(statsComp, bp, 0) end) then return end
+            if try("StatsComp." .. name .. "(statRow)", function() fn(statsComp, statRow) end) then return end
+        end
+    end
+
+    local inv = getInventory(char)
+    if inv and inv:IsValid() then
+        for _, name in ipairs(altNames) do
+            local fn = inv[name]
+            if fn and type(fn) == "function" then
+                if try("Inv." .. name .. "(ItemBP)", function() fn(inv, bp) end) then return end
+                if try("Inv." .. name .. "(statRow,0)", function() fn(inv, statRow, 0) end) then return end
+            end
+        end
+    end
+
+    if char then
+        for _, name in ipairs({"ApplyStats", "RefreshStats", "RecalculateStats"}) do
+            local fn = char[name]
+            if fn and type(fn) == "function" then
+                if try("Char." .. name .. "(statRow,0)", function() fn(char, statRow, 0) end) then return end
+            end
+        end
+    end
+
+    if StaticFindObject and statsComp.Class and statsComp.Class.GetDefaultObject then
+        pcall(function()
+            local ufn = StaticFindObject("/Script/Engine.StatsComponent:ApplyStats")
+            if ufn and ufn:IsValid() then
+                if try("ProcessEvent ApplyStats", function() statsComp:ProcessEvent(ufn, { statRow, 0 }) end) then return end
+            end
+        end)
+    end
+
+    pcall(function()
+        local cls = statsComp.GetClass and statsComp:GetClass()
+        if not cls or not cls:IsValid() or not cls.GetFullName then return end
+        local clsName = cls:GetFullName()
+        local ufn = StaticFindObject and StaticFindObject(clsName .. ":ApplyStats")
+        if ufn and ufn:IsValid() then
+            if try("ProcessEvent ApplyStats(" .. tostring(clsName) .. ")", function() statsComp:ProcessEvent(ufn, { statRow, 0 }) end) then return end
+            if try("ProcessEvent ApplyStats(ItemBP)", function() statsComp:ProcessEvent(ufn, { bp, 0 }) end) then return end
+        end
+    end)
+
+    local inv2 = getInventory(char)
+    if inv2 and inv2:IsValid() then
+        local item = nil
+        if inv2.FindItemByID and ThirdRing.ItemID then
+            local ok, res = pcall(function() return inv2:FindItemByID(ThirdRing.ItemID) end)
+            if ok and res then item = res end
+        end
+        local equipNames = { "EquipItem", "EquipItemInSlot", "SetEquippedItem", "EquipItemToSlot", "ApplyItemStats", "AddItemStats", "OnItemEquipped", "NotifyItemEquipped" }
+        for _, name in ipairs(equipNames) do
+            local fn = inv2[name]
+            if fn and type(fn) == "function" then
+                if item and try("Inv." .. name .. "(Trinket3,item)", function()
+                    local slotFName = FName and FName("Trinket3", EFindName.FNAME_Find) or nil
+                    if slotFName then fn(inv2, slotFName, item) else fn(inv2, "Trinket3", item) end
+                end) then return end
+                if item and try("Inv." .. name .. "(item)", function() fn(inv2, item) end) then return end
+            end
+        end
+    end
+
+    log("[STAT] all ApplyStats attempts failed")
+end
+
+local function assignThirdRing()
+    log("--- assignThirdRing (Ctrl+G) ---")
+    local char = getCharacter()
+    local inv = getInventory(char)
+    if not inv then log("No inventory"); return nil, nil end
+    if isThirdRingNowInSlot1Or2(inv) then clearThirdRingState() end
+    local ringCount = getUniqueRingCount(inv)
+    local selected = getSelectedInventoryItem()
+    local itemID = selected
+    if type(selected) == "userdata" and selected and selected.ItemID then itemID = selected.ItemID end
+    log("Ring count=" .. tostring(ringCount) .. " Selected itemID=" .. tostring(itemID))
+    if ringCount < MIN_RINGS_FOR_THIRD_SLOT then log("Need at least " .. tostring(MIN_RINGS_FOR_THIRD_SLOT) .. " rings"); return nil, nil end
+    if not itemID or itemID == 0 then log("Select a ring in Trinket list first"); return nil, nil end
+    local findFn = inv.FindItemByID
+    if not findFn then log("FindItemByID not found"); return nil, nil end
+    local item = findFn(inv, itemID)
+    if not item then log("Selected item not in inventory"); return nil, nil end
+    if not isRingItem(item) then log("Selected item is not a ring"); return nil, nil end
+    if isEquippedInSlot1Or2(inv, itemID) or isEquippedInSlot1Or2ByItem(inv, item) then log("Already equipped in slot 1 or 2"); return nil, nil end
+
+    local displayName = nil
+    local okCdo, cdoLabel = pcall(function()
+        if not item.ItemBP or not item.ItemBP:IsValid() then return nil end
+        local getCdo = item.ItemBP.GetCDO
+        if not getCdo then return nil end
+        local cdo = getCdo(item.ItemBP)
+        if not cdo or not cdo:IsValid() or not cdo.Label then return nil end
+        local lbl = cdo.Label
+        if type(lbl) == "string" then return lbl end
+        if type(lbl) == "userdata" and lbl.ToString and type(lbl.ToString) == "function" then return lbl:ToString() end
+        return tostring(lbl)
+    end)
+    if okCdo and cdoLabel and type(cdoLabel) == "string" and #cdoLabel > 0 then displayName = cdoLabel end
+    if not displayName or displayName == "" then displayName = getRingDisplayNameFromBP(item.ItemBP) end
+    if displayName == "" then displayName = "?" end
+
+    setThirdRing(itemID, item.ItemBP, displayName)
+    log("3rd ring assigned: " .. tostring(displayName))
+    updateInventoryLabel()
+    pcall(tryApplyThirdRingStats)
+    if not tickerStarted then
+        tickerStarted = true
+        ExecuteWithDelay(3000, scheduleLabelRefresh)
+        log("Ticker started (3s refresh).")
+    end
+    log("--- assignThirdRing done ---")
+    return char, inv
+end
+
+local function clearThirdRing()
+    log("--- clearThirdRing (Ctrl+Y) ---")
+    clearThirdRingState()
+    log("3rd ring cleared")
+    updateInventoryLabel()
+    log("--- clearThirdRing done ---")
+end
+
+local function logThirdRingStatus()
+    log("--- logThirdRingStatus (F6) ---")
+    if getThirdRingDisplayName() then
+        log("3rd ring: " .. tostring(getThirdRingDisplayName()) .. " (ItemID " .. tostring(ThirdRing.ItemID) .. ")")
+    else
+        log("3rd ring: (none)")
+    end
+    log("--- F6 done ---")
+end
+
+local KEYWORDS = { "stat", "equip", "trinket", "slot", "item", "apply", "add", "modifier", "refresh", "recalc", "update", "modify" }
+local function fnNameMatches(nameStr)
+    if not nameStr or type(nameStr) ~= "string" then return false end
+    local lower = nameStr:lower()
+    for _, kw in ipairs(KEYWORDS) do
+        if lower:find(kw) then return true end
+    end
+    return false
+end
+
+local function statApplyDiscovery()
+    log("--- statApplyDiscovery (F7) ---")
+    pcall(function()
+        local char = getCharacter()
+        if not char or not char:IsValid() then log("[F7] no character"); return end
+        local inv = getInventory(char)
+        local statsComp = char.StatsComp or char.StatsComponent or char["StatsComp"] or char.StatComponent
+        if not statsComp and char.Components and char.Components.Num then
+            local n = char.Components:Num()
+            for i = 0, n - 1 do
+                local c = char.Components[i]
+                if c and c:IsValid() and c.ApplyStats then statsComp = c break end
+            end
+        end
+        local function dumpFns(label, obj)
+            if not obj or not obj:IsValid() then log("[F7] " .. label .. " nil/invalid"); return end
+            local cls = obj.GetClass and obj:GetClass()
+            if not cls or not cls:IsValid() or not cls.ForEachFunction then log("[F7] " .. label .. " no ForEachFunction"); return end
+            log("[F7] " .. label .. " class=" .. (cls.GetFullName and cls:GetFullName() or "?"))
+            cls:ForEachFunction(function(ufn)
+                if ufn and ufn:IsValid() and ufn.GetFName then
+                    local n = ufn:GetFName()
+                    local str = n and n.ToString and n:ToString() or tostring(n)
+                    if fnNameMatches(str) then log("[F7]   " .. str) end
+                end
+                return false
+            end)
+        end
+        dumpFns("StatsComp", statsComp)
+        dumpFns("Inv", inv)
+        dumpFns("Char", char)
+    end)
+    log("--- F7 done ---")
+end
+
+local function statApplyDiscoveryFull()
+    log("--- statApplyDiscovery FULL (F8) - no filter ---")
+    pcall(function()
+        local char = getCharacter()
+        if not char or not char:IsValid() then log("[F8] no character"); return end
+        local inv = getInventory(char)
+        local statsComp = char.StatsComp or char.StatsComponent or char["StatsComp"] or char.StatComponent
+        if not statsComp and char.Components and char.Components.Num then
+            local n = char.Components:Num()
+            for i = 0, n - 1 do
+                local c = char.Components[i]
+                if c and c:IsValid() and c.ApplyStats then statsComp = c break end
+            end
+        end
+        local function dumpAllFns(label, obj)
+            if not obj or not obj:IsValid() then log("[F8] " .. label .. " nil/invalid"); return end
+            local cls = obj.GetClass and obj:GetClass()
+            if not cls or not cls:IsValid() or not cls.ForEachFunction then log("[F8] " .. label .. " no ForEachFunction"); return end
+            log("[F8] " .. label .. " class=" .. (cls.GetFullName and cls:GetFullName() or "?"))
+            local count = 0
+            cls:ForEachFunction(function(ufn)
+                if ufn and ufn:IsValid() and ufn.GetFName then
+                    local n = ufn:GetFName()
+                    local str = n and n.ToString and n:ToString() or tostring(n)
+                    log("[F8]   " .. str)
+                    count = count + 1
+                end
+                return false
+            end)
+            log("[F8] " .. label .. " total fns=" .. tostring(count))
+        end
+        dumpAllFns("StatsComp", statsComp)
+        dumpAllFns("Inv", inv)
+        dumpAllFns("Char", char)
+    end)
+    log("--- F8 done ---")
+end
+
+local function dumpInvClassHierarchy()
+    log("--- F9: Inv class + parent classes, all function names ---")
+    pcall(function()
+        local char = getCharacter()
+        if not char or not char:IsValid() then log("[F9] no character"); return end
+        local inv = getInventory(char)
+        if not inv or not inv:IsValid() then log("[F9] no inv"); return end
+        local cls = inv.GetClass and inv:GetClass()
+        if not cls or not cls:IsValid() then log("[F9] no class"); return end
+        local depth = 0
+        while cls and cls:IsValid() do
+            local clsName = cls.GetFullName and cls:GetFullName() or tostring(cls)
+            log("[F9] --- class " .. tostring(depth) .. " " .. clsName .. " ---")
+            if cls.ForEachFunction then
+                local pathPrefix = (clsName and clsName:gsub("^Class%s+", "") or "")
+                cls:ForEachFunction(function(ufn)
+                    if ufn and ufn:IsValid() and ufn.GetFName then
+                        local n = ufn:GetFName()
+                        local str = n and n.ToString and n:ToString() or tostring(n)
+                        log("[F9]   " .. str .. "  => " .. pathPrefix .. ":" .. str)
+                    end
+                    return false
+                end)
+            end
+            cls = cls.GetSuperStruct and cls:GetSuperStruct() or nil
+            depth = depth + 1
+            if depth > 15 then break end
+        end
+    end)
+    log("--- F9 done ---")
+end
+
+local function init()
+    local equipTraceHooksDone = false
+    local function runEquipTraceHookSetup(char, invFromAssign)
+        if not (ENABLE_EQUIP_TRACE and RegisterHook) then return end
+        if equipTraceHooksDone then return end
+        pcall(function()
+            local char = char or (GetPlayerController() and getCharacter())
+            if not char or not char:IsValid() then log("[EQUIP_TRACE] no char") return end
+            local inv = invFromAssign or getInventory(char)
+            log("[EQUIP_TRACE] inv=" .. tostring(inv) .. " valid=" .. (inv and inv:IsValid() and "yes" or "no"))
+            local statsComp = char.StatsComp or char.StatsComponent or char["StatsComp"]
+            if not statsComp and char.Components and char.Components.Num then
+                for i = 0, (char.Components:Num() or 0) - 1 do
+                    local c = char.Components[i]
+                    if c and c:IsValid() and c.ApplyStats then statsComp = c break end
+                end
+            end
+            log("[EQUIP_TRACE] statsComp=" .. tostring(statsComp) .. " valid=" .. (statsComp and statsComp:IsValid() and "yes" or "no"))
+            local allPaths = {}
+            local function collectPathsFromClass(cls, depth)
+                if not cls or not cls:IsValid() or depth > 12 then return end
+                local fullName = cls.GetFullName and cls:GetFullName() or ""
+                local pathPrefix = fullName:gsub("^Class%s+", "")
+                if pathPrefix == "" then return end
+                if cls.ForEachFunction then
+                    cls:ForEachFunction(function(ufn)
+                        pcall(function()
+                            if ufn and ufn:IsValid() and ufn.GetFName then
+                                local n = ufn:GetFName()
+                                local fnStr = n and n.ToString and n:ToString() or tostring(n)
+                                if fnStr and fnStr ~= "" then
+                                    allPaths[#allPaths + 1] = pathPrefix .. ":" .. fnStr
+                                end
+                            end
+                        end)
+                        return true
+                    end)
+                end
+                if cls.GetSuperStruct then
+                    collectPathsFromClass(cls:GetSuperStruct(), depth + 1)
+                end
+            end
+            if inv and inv:IsValid() then
+                local ic = inv.GetClass and inv:GetClass()
+                if ic and ic:IsValid() then
+                    log("[EQUIP_TRACE] collecting Inv class hierarchy...")
+                    local okInv, errInv = pcall(function() collectPathsFromClass(ic, 0) end)
+                    if not okInv then log("[EQUIP_TRACE] Inv collectPathsFromClass error: " .. tostring(errInv)) end
+                    log("[EQUIP_TRACE] after Inv: allPaths count=" .. tostring(#allPaths))
+                else
+                    log("[EQUIP_TRACE] Inv has no valid GetClass")
+                end
+            end
+            if statsComp and statsComp:IsValid() then
+                local sc = statsComp.GetClass and statsComp:GetClass()
+                if sc and sc:IsValid() then
+                    log("[EQUIP_TRACE] collecting StatsComp class hierarchy...")
+                    local okSc, errSc = pcall(function() collectPathsFromClass(sc, 0) end)
+                    if not okSc then log("[EQUIP_TRACE] StatsComp collectPathsFromClass error: " .. tostring(errSc)) end
+                    log("[EQUIP_TRACE] after StatsComp: allPaths count=" .. tostring(#allPaths))
+                else
+                    log("[EQUIP_TRACE] StatsComp has no valid GetClass")
+                end
+            end
+            if char and char:IsValid() then
+                local cc = char.GetClass and char:GetClass()
+                if cc and cc:IsValid() then
+                    log("[EQUIP_TRACE] collecting Char class hierarchy...")
+                    local okCc, errCc = pcall(function() collectPathsFromClass(cc, 0) end)
+                    if not okCc then log("[EQUIP_TRACE] Char collectPathsFromClass error: " .. tostring(errCc)) end
+                    log("[EQUIP_TRACE] after Char: allPaths count=" .. tostring(#allPaths))
+                end
+            end
+            local pc = GetPlayerController()
+            if pc and pc:IsValid() then
+                local pcc = pc.GetClass and pc:GetClass()
+                if pcc and pcc:IsValid() then
+                    log("[EQUIP_TRACE] collecting PlayerController class hierarchy...")
+                    local okPc, errPc = pcall(function() collectPathsFromClass(pcc, 0) end)
+                    if not okPc then log("[EQUIP_TRACE] PlayerController collectPathsFromClass error: " .. tostring(errPc)) end
+                    log("[EQUIP_TRACE] after PlayerController: allPaths count=" .. tostring(#allPaths))
+                end
+            end
+            local invWidget = FindFirstOf("Widget_Inventory_C")
+            if not invWidget and FindFirstOf then
+                pcall(function() invWidget = FindFirstOf("Widget_Inventory") end)
+            end
+            if invWidget and invWidget:IsValid() then
+                local wc = invWidget.GetClass and invWidget:GetClass()
+                if wc and wc:IsValid() then
+                    log("[EQUIP_TRACE] collecting Widget_Inventory class hierarchy...")
+                    local okW, errW = pcall(function() collectPathsFromClass(wc, 0) end)
+                    if not okW then log("[EQUIP_TRACE] Widget collectPathsFromClass error: " .. tostring(errW)) end
+                    log("[EQUIP_TRACE] after Widget: allPaths count=" .. tostring(#allPaths))
+                end
+            else
+                log("[EQUIP_TRACE] no Widget_Inventory (open inventory before Ctrl+G to add widget paths)")
+            end
+            local knownPaths = {
+                "/Script/GunfireRuntime.InventoryComponent:EquipItem",
+                "/Script/GunfireRuntime.InventoryComponent:EquipItemByID",
+                "/Script/GunfireRuntime.InventoryComponent:ServerEquipItemByID",
+                "/Script/GunfireRuntime.InventoryComponent:ServerUnequipItemByID",
+                "/Script/GunfireRuntime.InventoryComponent:UnequipItem",
+                "/Script/GunfireRuntime.InventoryComponent:GetEquippedItem",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:ServerEquipItem",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:ClientEquipItem",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:EquipItem",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:SetEquippedItem",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:EquipItemInSlot",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:UnequipItem",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:OnRep_EquippedItems",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:ServerUnequipItem",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:ClientUnequipItem",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:EquipItemToSlot",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:SetEquippedItemInSlot",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:GetEquippedItem",
+                "/Script/Remnant.RemnantPlayerInventoryComponent:ServerOnClientExceptionUpdate",
+                "/Script/GunfireRuntime.StatsComponent:ApplyStats",
+                "/Script/GunfireRuntime.StatsComponent:SetComputedStats",
+                "/Script/GunfireRuntime.StatsComponent:RecalculateStats",
+                "/Script/GunfireRuntime.StatsComponent:AddModifier",
+                "/Script/GunfireRuntime.StatsComponent:RemoveModifier",
+                "/Script/GunfireRuntime.StatsComponent:UpdateStats",
+                "/Script/GunfireRuntime.StatsComponent:NotifyStatsUpdated",
+                "/Script/Engine.Actor:GetComponentByClass",
+                "/Script/Engine.PlayerController:ClientRestart",
+                "/Script/Engine.PlayerController:ServerRestart",
+                "/Script/UMG.UserWidget:OnClicked",
+                "/Script/UMG.UserWidget:OnPressed",
+                "/Script/UMG.UserWidget:OnReleased",
+                "/Script/UMG.WidgetBlueprintLibrary:Create",
+                "/Script/Engine.GameInstance:Init",
+                "/Script/Remnant.RemnantPlayerController:ServerEquipItem",
+                "/Script/Remnant.RemnantPlayerController:ClientEquipItem",
+                "/Script/Remnant.RemnantPlayerController:EquipItem",
+                "/Script/Remnant.RemnantPlayerController:RequestEquipItem",
+                "/Script/Remnant.RemnantPlayerController:ServerRequestEquip",
+            }
+            for _, p in ipairs(knownPaths) do
+                allPaths[#allPaths + 1] = p
+            end
+            log("[EQUIP_TRACE] after known paths: allPaths count=" .. tostring(#allPaths))
+            local seen = {}
+            local uniquePaths = {}
+            for _, p in ipairs(allPaths) do
+                if not seen[p] then seen[p] = true uniquePaths[#uniquePaths + 1] = p end
+            end
+            local MAX_HOOKS = 2500
+            if #uniquePaths > MAX_HOOKS then
+                local trimmed = {}
+                for i = 1, MAX_HOOKS do trimmed[i] = uniquePaths[i] end
+                uniquePaths = trimmed
+                log("[EQUIP_TRACE] trimmed to " .. tostring(MAX_HOOKS) .. " paths")
+            end
+            log("[EQUIP_TRACE] total paths to try: " .. tostring(#uniquePaths))
+            local hooked = 0
+            for _, path in ipairs(uniquePaths) do
+                pcall(function()
+                    local ok = pcall(function()
+                        RegisterHook(path, function(self, ...)
+                            local args = { ... }
+                            local pathCopy = path
+                            local run = function()
+                                pcall(function()
+                                    if pathCopy:find("EquipItem") or pathCopy:find("UnequipItem") or pathCopy:find("ApplyStats") or pathCopy:find("SetComputedStats") then
+                                        pendingReapplyThirdRing = true
+                                    end
+                                    local argStr = ""
+                                    for i, v in ipairs(args) do
+                                        local val = v
+                                        if type(v) == "userdata" and v and (v.get or v.Get) then
+                                            local ok, g = pcall(function() return v:get() end)
+                                            if ok then val = g end
+                                        end
+                                        argStr = argStr .. " [" .. i .. "]=" .. tostring(val)
+                                    end
+                                    log("[EQUIP_TRACE] CALLED " .. pathCopy .. argStr)
+                                end)
+                            end
+                            if ExecuteInGameThread then ExecuteInGameThread(run) else pcall(run) end
+                        end)
+                    end)
+                    if ok then hooked = hooked + 1 log("[EQUIP_TRACE] hooked: " .. path) end
+                end)
+            end
+            if hooked > 0 then
+                equipTraceHooksDone = true
+            end
+            log("[EQUIP_TRACE] done. hooked " .. tostring(hooked) .. "/" .. tostring(#uniquePaths) .. ". Equip ring in slot 1 or 2 and check log for CALLED.")
+        end)
+    end
+    if ENABLE_EQUIP_TRACE and RegisterHook and NotifyOnNewObject then
+        pcall(function()
+            NotifyOnNewObject("/Script/Remnant.RemnantPlayerInventoryComponent", function(inv)
+                if ExecuteInGameThread then
+                    ExecuteInGameThread(function()
+                        if equipTraceHooksDone then return end
+                        local pc = GetPlayerController()
+                        if not pc or not pc:IsValid() then return end
+                        local char = getCharacter()
+                        if not char or not char:IsValid() or not inv or not inv:IsValid() then return end
+                        log("[EQUIP_TRACE] NotifyOnNewObject: got RemnantPlayerInventoryComponent, running hook setup")
+                        runEquipTraceHookSetup(char, inv)
+                    end)
+                end
+            end)
+            log("[EQUIP_TRACE] registered NotifyOnNewObject for RemnantPlayerInventoryComponent")
+        end)
+    end
+    pcall(function()
+        RegisterKeyBind(Key.G, { ModifierKey.CONTROL }, function()
+            pcall(function() log("[KEY] Ctrl+G: assignThirdRing") end)
+            safeInWorld(function()
+                local char, inv = assignThirdRing()
+                runEquipTraceHookSetup(char, inv)
+            end)
+        end)
+    end)
+    pcall(function()
+        RegisterKeyBind(Key.Y, { ModifierKey.CONTROL }, function()
+            pcall(function() log("[KEY] Ctrl+Y: clearThirdRing") end)
+            safe(clearThirdRing)
+        end)
+    end)
+    pcall(function()
+        RegisterKeyBind(Key.F6, function()
+            pcall(function() log("[KEY] F6: logThirdRingStatus") end)
+            safeInWorld(logThirdRingStatus)
+        end)
+    end)
+    pcall(function()
+        RegisterKeyBind(Key.F7, function()
+            pcall(function() log("[KEY] F7: statApplyDiscovery") end)
+            safeInWorld(statApplyDiscovery)
+        end)
+    end)
+    pcall(function()
+        RegisterKeyBind(Key.F8, function()
+            pcall(function() log("[KEY] F8: statApplyDiscoveryFull") end)
+            safeInWorld(statApplyDiscoveryFull)
+        end)
+    end)
+    pcall(function()
+        RegisterKeyBind(Key.F9, function()
+            pcall(function() log("[KEY] F9: dumpInvClassHierarchy") end)
+            safeInWorld(dumpInvClassHierarchy)
+        end)
+    end)
+    pcall(function() log("Loaded. Ctrl+G=assign 3rd ring, Ctrl+Y=clear, F6=status, F7=stat discovery, F8=full fn list, F9=Inv class hierarchy.") end)
+    pcall(function() log("ENABLE_STAT_APPLY=" .. tostring(ENABLE_STAT_APPLY) .. ".") end)
+    pcall(function() log("ENABLE_EQUIP_TRACE=" .. tostring(ENABLE_EQUIP_TRACE) .. " (hook equip/stat fns, then equip ring in slot 1 or 2 and check log).") end)
+    pcall(function() log("LOG_STAT_DIAG=" .. tostring(LOG_STAT_DIAG) .. " LOG_TICKER=" .. tostring(LOG_TICKER)) end)
+    pcall(function() log("--- init done ---") end)
+
+    if ENABLE_EQUIP_TRACE and RegisterHook then
+        ExecuteWithDelay(20000, runEquipTraceHookSetup)
+    end
+end
+
+pcall(function() safe(init) end)

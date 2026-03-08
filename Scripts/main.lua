@@ -1,17 +1,34 @@
-local UEHelpers = require("UEHelpers")
-local GetPlayerController = UEHelpers.GetPlayerController
-local GetWorld = UEHelpers.GetWorld
+local UEHelpers = nil
+local function getUEHelpers()
+ if not UEHelpers then UEHelpers = require("UEHelpers") end
+ return UEHelpers
+end
+local function GetPlayerController()
+ return getUEHelpers().GetPlayerController()
+end
+local function GetWorld()
+ return getUEHelpers().GetWorld()
+end
 
 local MOD_PREFIX = "[SurvivalThirdRing] "
 local MIN_RINGS_FOR_THIRD_SLOT = 1
-local LOG_VERBOSE = true
+local LOG_VERBOSE = false
+local ENABLE_STAT_APPLY = true
+local ENABLE_EQUIP_POST_HOOK = true
+local LOG_EQUIP_HOOK = true
+local LOG_DEBUG_STEPS = false
 
 local ExtraRingItemID = 0
 local ExtraRingItemBP = nil
 local ExtraRingDisplayName = nil
+local tickerStarted = false
+
+if LOG_DEBUG_STEPS then pcall(function() print("[SurvivalThirdRing] step 0 script loaded\n") end) end
 
 local function log(msg)
- print(MOD_PREFIX .. msg .. "\n")
+ pcall(function()
+ print(MOD_PREFIX .. tostring(msg) .. "\n")
+ end)
 end
 
 local function logStep(tag, msg)
@@ -30,22 +47,22 @@ local function safe(fn)
 end
 
 local function getCharacter()
+ local out = nil
+ pcall(function()
  logStep("CHAR", "getCharacter() start")
  local pc = GetPlayerController()
- if not pc or not pc:IsValid() then
- logStep("CHAR", "fail: no/invalid PlayerController")
- return nil
- end
+ if not pc or not pc:IsValid() then logStep("CHAR", "fail: no/invalid PlayerController"); return end
  local pawn = pc.Pawn
- if not pawn or not pawn:IsValid() then
- logStep("CHAR", "fail: no/invalid Pawn")
- return nil
- end
+ if not pawn or not pawn:IsValid() then logStep("CHAR", "fail: no/invalid Pawn"); return end
  logStep("CHAR", "getCharacter() => ok")
- return pawn
+ out = pawn
+ end)
+ return out
 end
 
 local function getInventory(char)
+ local result = nil
+ pcall(function()
  logStep("INV", "getInventory() start")
  local pc = GetPlayerController()
  if pc and pc:IsValid() then
@@ -54,33 +71,34 @@ local function getInventory(char)
  local inv = getPlayerInv(pc)
  if inv and inv:IsValid() then
  logStep("INV", "getInventory() => GetPlayerInventory(pc)")
- return inv
+ result = inv
+ return
  end
  end
  end
  if not char or not char:IsValid() then
  logStep("INV", "fail: no char for fallbacks")
- return nil
+ return
  end
  local inv = char.Inventory
- if inv and inv:IsValid() then logStep("INV", "getInventory() => char.Inventory") return inv end
+ if inv and inv:IsValid() then logStep("INV", "getInventory() => char.Inventory"); result = inv return end
  inv = char.InventoryComponent
- if inv and inv:IsValid() then logStep("INV", "getInventory() => char.InventoryComponent") return inv end
+ if inv and inv:IsValid() then logStep("INV", "getInventory() => char.InventoryComponent"); result = inv return end
  inv = char.PlayerInventory
- if inv and inv:IsValid() then logStep("INV", "getInventory() => char.PlayerInventory") return inv end
+ if inv and inv:IsValid() then logStep("INV", "getInventory() => char.PlayerInventory"); result = inv return end
  inv = char.RemnantPlayerInventory
- if inv and inv:IsValid() then logStep("INV", "getInventory() => char.RemnantPlayerInventory") return inv end
+ if inv and inv:IsValid() then logStep("INV", "getInventory() => char.RemnantPlayerInventory"); result = inv return end
  inv = char.MyInventory
- if inv and inv:IsValid() then logStep("INV", "getInventory() => char.MyInventory") return inv end
+ if inv and inv:IsValid() then logStep("INV", "getInventory() => char.MyInventory"); result = inv return end
  if pc and pc:IsValid() then
  inv = pc.InventoryComponent
- if inv and inv:IsValid() then logStep("INV", "getInventory() => pc.InventoryComponent") return inv end
+ if inv and inv:IsValid() then logStep("INV", "getInventory() => pc.InventoryComponent"); result = inv return end
  inv = pc.PlayerInventory
- if inv and inv:IsValid() then logStep("INV", "getInventory() => pc.PlayerInventory") return inv end
+ if inv and inv:IsValid() then logStep("INV", "getInventory() => pc.PlayerInventory"); result = inv return end
  inv = pc.RemnantPlayerInventory
- if inv and inv:IsValid() then logStep("INV", "getInventory() => pc.RemnantPlayerInventory") return inv end
+ if inv and inv:IsValid() then logStep("INV", "getInventory() => pc.RemnantPlayerInventory"); result = inv return end
  inv = pc.Inventory
- if inv and inv:IsValid() then logStep("INV", "getInventory() => pc.Inventory") return inv end
+ if inv and inv:IsValid() then logStep("INV", "getInventory() => pc.Inventory"); result = inv return end
  end
  local comps = char.Components
  if comps and comps.Num then
@@ -90,13 +108,15 @@ local function getInventory(char)
  local c = comps[i]
  if c and c:IsValid() and c.GetItems then
  logStep("INV", "getInventory() => Components[" .. tostring(i) .. "] (GetItems)")
- return c
+ result = c
+ return
  end
  end
  end
  end
  logStep("INV", "getInventory() => nil")
- return nil
+ end)
+ return result
 end
 
 local function isRingItem(item)
@@ -275,14 +295,189 @@ local function refreshLabelOnly()
  end)
 end
 
+local function tryApplyThirdRingStats()
+ if LOG_DEBUG_STEPS then pcall(function() print("[SurvivalThirdRing] step S1 stat apply start\n") end) end
+ if not ENABLE_STAT_APPLY then return end
+ local pc = GetPlayerController()
+ if not pc or not pc:IsValid() then return end
+ local pawn = pc.Pawn
+ if not pawn or not pawn:IsValid() then return end
+ local bp = ExtraRingItemBP
+ if not bp or not bp:IsValid() then return end
+ local char = getCharacter()
+ if not char or not char:IsValid() then return end
+ local statsComp = char.StatsComp or char.StatsComponent or char["StatsComp"] or char.StatComponent
+ if not statsComp or not statsComp:IsValid() then
+ local comps = char.Components
+ if comps and comps.Num then
+ local n = comps:Num()
+ for i = 0, n - 1 do
+ local c = comps[i]
+ if c and c:IsValid() and c.ApplyStats then statsComp = c break end
+ end
+ end
+ end
+ if not statsComp or not statsComp:IsValid() then return end
+ local invItem = nil
+ pcall(function()
+ local inv2 = getInventory(char)
+ if inv2 and inv2:IsValid() and inv2.FindItemByID and ExtraRingItemID then
+ invItem = inv2:FindItemByID(ExtraRingItemID)
+ end
+ end)
+ local cdo = nil
+ if bp.GetCDO then cdo = bp:GetCDO() end
+ if not cdo or not cdo:IsValid() then return end
+ local statRow = cdo.Stats or cdo.StatHandle or cdo.StatModifiers or cdo.InspectInfo
+ if not statRow then
+ if cdo.InspectInfo and cdo.InspectInfo.Stats then statRow = cdo.InspectInfo.Stats end
+ if not statRow and cdo.DataTableRowHandle then statRow = cdo.DataTableRowHandle end
+ end
+ if not statRow then return end
+ local function try(fn)
+ return pcall(fn)
+ end
+ if statsComp.AddModifier then
+ if invItem and try(function() statsComp:AddModifier(invItem) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if try(function() statsComp:AddModifier(bp) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if try(function() statsComp:AddModifier(statRow) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if try(function() statsComp:AddModifier(bp, 0) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ end
+ if statsComp.ModifyStat then
+ if invItem and try(function() statsComp:ModifyStat(invItem) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if invItem and try(function() statsComp:ModifyStat(invItem, 0) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if try(function() statsComp:ModifyStat(bp) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if try(function() statsComp:ModifyStat(bp, 0) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if try(function() statsComp:ModifyStat(statRow) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ end
+ if statsComp.ApplyStats then
+ if invItem and try(function() statsComp:ApplyStats(invItem, 0) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if invItem and try(function() statsComp:ApplyStats(invItem, 1) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if try(function() statsComp:ApplyStats(bp, 0) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if try(function() statsComp:ApplyStats(bp, 1) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if try(function() statsComp:ApplyStats(bp) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if try(function() statsComp:ApplyStats(statRow, 0) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if try(function() statsComp:ApplyStats(statRow) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ local rn, dt = nil, nil
+ pcall(function() rn = statRow.RowName dt = statRow.DataTable end)
+ if rn and dt and dt.IsValid and dt:IsValid() then
+ if try(function() statsComp:ApplyStats(dt, rn, 0) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ local rnStr = nil
+ pcall(function() if rn and rn.ToString then rnStr = rn:ToString() end end)
+ if rnStr then
+ if try(function() statsComp:ApplyStats(dt, rnStr, 0) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if dt.FindRow then
+ local rowData = nil
+ pcall(function() rowData = dt:FindRow(rnStr) end)
+ if rowData and try(function() statsComp:ApplyStats(rowData, 0) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ end
+ end
+ end
+ if statsComp.ApplyStatModsTo then
+ if try(function() statsComp:ApplyStatModsTo(statRow) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if try(function() statsComp:ApplyStatModsTo(bp) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ if invItem and try(function() statsComp:ApplyStatModsTo(invItem) end) then
+ if statsComp.RecalculateStats then pcall(function() statsComp:RecalculateStats() end) end
+ if statsComp.RefreshStats then pcall(function() statsComp:RefreshStats() end) end
+ return
+ end
+ end
+end
+
 local TICKER_INTERVAL_MS = 3000
 
 local function scheduleLabelRefresh()
  pcall(function()
+ if LOG_DEBUG_STEPS then pcall(function() print("[SurvivalThirdRing] step T1 ticker run\n") end) end
  if ExtraRingDisplayName then
  local pc = GetPlayerController()
  local pawn = pc and pc:IsValid() and pc.Pawn
  if pawn and pawn:IsValid() then
+ if LOG_DEBUG_STEPS then pcall(function() print("[SurvivalThirdRing] step T2 before refresh\n") end) end
  refreshLabelOnly()
  end
  end
@@ -341,16 +536,16 @@ local function updateInventoryLabel()
  end
  local widget = FindFirstOf("Widget_Inventory_C")
  if not widget or not widget:IsValid() then
- logStep("UI", "updateInventoryLabel: no widget")
+ log("3rd label: Widget_Inventory_C not found (envanter kapalı veya farklı isim?)")
  return
  end
  local label = widget.ItemTypeLabel
  if not label or not label:IsValid() then
- logStep("UI", "updateInventoryLabel: no ItemTypeLabel")
+ log("3rd label: ItemTypeLabel yok veya geçersiz")
  return
  end
  label:SetText(FText("3rd: " .. ExtraRingDisplayName))
- logStep("UI", "updateInventoryLabel: SetText ok")
+ log("3rd label: yazıldı -> 3rd: " .. tostring(ExtraRingDisplayName))
  end)
  if not ok1 then
  log("updateInventoryLabel error: " .. tostring(err1))
@@ -443,6 +638,12 @@ local function assignThirdRing()
  log("3rd ring assigned: " .. tostring(ExtraRingDisplayName))
  logStep("ASSIGN", "updateInventoryLabel()")
  updateInventoryLabel()
+ pcall(tryApplyThirdRingStats)
+ pcall(registerEquipStatHooks)
+ if not tickerStarted and ExecuteWithDelay then
+ tickerStarted = true
+ ExecuteWithDelay(TICKER_INTERVAL_MS, scheduleLabelRefresh)
+ end
  log("--- assignThirdRing done ---")
 end
 
@@ -466,24 +667,103 @@ local function logThirdRingStatus()
  log("--- F6 done ---")
 end
 
-local function init()
- RegisterKeyBind(Key.G, { ModifierKey.CONTROL }, function()
- log("[KEY] Ctrl+G: assignThirdRing")
- safe(assignThirdRing)
- end)
- RegisterKeyBind(Key.Y, { ModifierKey.CONTROL }, function()
- log("[KEY] Ctrl+Y: clearThirdRing")
- safe(clearThirdRing)
- end)
- RegisterKeyBind(Key.F6, function()
- log("[KEY] F6: logThirdRingStatus")
- safe(logThirdRingStatus)
- end)
- log("Loaded. Ctrl+G=assign 3rd ring, Ctrl+Y=clear, F6=status. LOG_VERBOSE=" .. tostring(LOG_VERBOSE))
- if ExecuteWithDelay then
- ExecuteWithDelay(TICKER_INTERVAL_MS, scheduleLabelRefresh)
+local EQUIP_STAT_HOOK_PATHS = {
+ "/Script/GunfireRuntime.InventoryComponent:EquipItem",
+ "/Script/GunfireRuntime.InventoryComponent:EquipItemByID",
+ "/Script/GunfireRuntime.InventoryComponent:UnequipItem",
+ "/Script/Remnant.RemnantPlayerInventoryComponent:EquipItem",
+ "/Script/Remnant.RemnantPlayerInventoryComponent:ClientEquipItem",
+ "/Script/Remnant.RemnantPlayerInventoryComponent:ServerEquipItem",
+ "/Script/Remnant.RemnantPlayerInventoryComponent:UnequipItem",
+ "/Script/Remnant.RemnantPlayerInventoryComponent:OnRep_EquippedItems",
+ "/Script/GunfireRuntime.StatsComponent:ApplyStats",
+ "/Script/GunfireRuntime.StatsComponent:AddModifier",
+ "/Script/GunfireRuntime.StatsComponent:RecalculateStats",
+ "/Script/Remnant.RemnantPlayerController:RequestEquipItem",
+ "/Script/Remnant.RemnantPlayerController:ClientEquipItem",
+}
+local equipStatHooksRegistered = false
+local function registerEquipStatHooks()
+ if LOG_DEBUG_STEPS then pcall(function() print("[SurvivalThirdRing] step H1 hook register start\n") end) end
+ if not ENABLE_EQUIP_POST_HOOK or not RegisterHook or equipStatHooksRegistered then return end
+ pcall(function()
+ for _, path in ipairs(EQUIP_STAT_HOOK_PATHS) do
+ pcall(function()
+ RegisterHook(path, function(self, ...)
+ if LOG_EQUIP_HOOK then
+ log("[HOOK] " .. path)
  end
- log("--- init done ---")
+ if ExecuteWithDelay then
+ ExecuteWithDelay(100, function()
+ pcall(tryApplyThirdRingStats)
+ end)
+ end
+ end)
+ end)
+ end
+ equipStatHooksRegistered = true
+ log("Equip/Stat post-hooks registered (" .. #EQUIP_STAT_HOOK_PATHS .. " paths). 3rd ring stats reapply on equip/stat.")
+ end)
 end
 
-safe(init)
+local function init()
+ if LOG_DEBUG_STEPS then pcall(function() print("[SurvivalThirdRing] step 1 init start\n") end) end
+ RegisterKeyBind(Key.G, { ModifierKey.CONTROL }, function()
+  log("[KEY] Ctrl+G: assignThirdRing")
+  if ExecuteInGameThread then
+   ExecuteInGameThread(function() safe(assignThirdRing) end)
+  else
+   safe(assignThirdRing)
+  end
+ end)
+ if LOG_DEBUG_STEPS then pcall(function() print("[SurvivalThirdRing] step 2 keybind G ok\n") end) end
+ RegisterKeyBind(Key.Y, { ModifierKey.CONTROL }, function()
+  log("[KEY] Ctrl+Y: clearThirdRing")
+  if ExecuteInGameThread then
+   ExecuteInGameThread(function() safe(clearThirdRing) end)
+  else
+   safe(clearThirdRing)
+  end
+ end)
+ if LOG_DEBUG_STEPS then pcall(function() print("[SurvivalThirdRing] step 3 keybind Y ok\n") end) end
+ RegisterKeyBind(Key.F6, function()
+  log("[KEY] F6: logThirdRingStatus")
+  if ExecuteInGameThread then
+   ExecuteInGameThread(function() safe(logThirdRingStatus) end)
+  else
+   safe(logThirdRingStatus)
+  end
+ end)
+ if LOG_DEBUG_STEPS then pcall(function() print("[SurvivalThirdRing] step 4 keybind F6 ok\n") end) end
+ log("SurvivalThirdRing: keybinds registered (Ctrl+G, Ctrl+Y, F6).")
+ if ExecuteWithDelay then
+ ExecuteWithDelay(500, function()
+ pcall(function()
+ log("Loaded. Ctrl+G=assign 3rd ring, Ctrl+Y=clear, F6=status.")
+ log("--- init done ---")
+ end)
+ end)
+ end
+end
+
+if LOG_DEBUG_STEPS then pcall(function() print("[SurvivalThirdRing] step 9 before deferred init\n") end) end
+if ExecuteWithDelay then
+ ExecuteWithDelay(15000, function()
+  if ExecuteInGameThread then
+   ExecuteInGameThread(function()
+    pcall(function()
+     log("SurvivalThirdRing: initializing (15s after load)...")
+     init()
+    end)
+   end)
+  else
+   pcall(function()
+    log("SurvivalThirdRing: initializing (15s after load)...")
+    init()
+   end)
+  end
+ end)
+else
+ safe(init)
+end
+if LOG_DEBUG_STEPS then pcall(function() print("[SurvivalThirdRing] step 10 deferred init scheduled\n") end) end
